@@ -1,0 +1,188 @@
+name: Generate top 300 western viral MP4 links
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade huggingface_hub hf_xet pyarrow
+
+      - name: Download metadata, filter and rank
+        env:
+          HF_HUB_ENABLE_HF_TRANSFER: "0"
+        run: |
+          cat > /tmp/generate_links.py <<'PY'
+          import json
+          import urllib.parse
+          from pathlib import Path
+
+          import pyarrow.parquet as pq
+          from huggingface_hub import hf_hub_download
+
+          REPO_ID = "Shofo/shofo-tiktok-general-small"
+          WESTERN_REGIONS = {
+              "US", "CA", "GB", "IE", "AU", "NZ",
+              "FR", "DE", "ES", "IT", "PT", "NL", "BE", "LU",
+              "CH", "AT", "DK", "SE", "NO", "FI", "IS"
+          }
+          OUTPUT = Path("top_300_videos_virales_occidentales.txt")
+          REPORT = Path("top_300_videos_virales_occidentales_report.json")
+
+          metadata_path = hf_hub_download(
+              repo_id=REPO_ID,
+              repo_type="dataset",
+              filename="metadata.parquet",
+          )
+
+          table = pq.read_table(
+              metadata_path,
+              columns=[
+                  "file_name",
+                  "video_id",
+                  "engagement_metrics",
+                  "language",
+                  "is_ai_generated",
+                  "is_ad",
+              ],
+          )
+
+          rows = []
+          rejected = {
+              "invalid_path": 0,
+              "invalid_json": 0,
+              "ad": 0,
+              "ai_generated": 0,
+              "non_western": 0,
+              "missing_views": 0,
+          }
+
+          data = table.to_pylist()
+          for item in data:
+              file_name = item.get("file_name")
+              if not isinstance(file_name, str) or not file_name.startswith("videos/") or not file_name.endswith(".mp4"):
+                  rejected["invalid_path"] += 1
+                  continue
+              if item.get("is_ad") is True:
+                  rejected["ad"] += 1
+                  continue
+              if item.get("is_ai_generated") is True:
+                  rejected["ai_generated"] += 1
+                  continue
+
+              try:
+                  metrics = json.loads(item.get("engagement_metrics") or "{}")
+                  language = json.loads(item.get("language") or "{}")
+              except (TypeError, json.JSONDecodeError):
+                  rejected["invalid_json"] += 1
+                  continue
+
+              region = str(language.get("region") or "").upper()
+              author_region = str(language.get("author_region") or "").upper()
+              if region not in WESTERN_REGIONS or author_region not in WESTERN_REGIONS:
+                  rejected["non_western"] += 1
+                  continue
+
+              try:
+                  play_count = int(metrics.get("play_count") or 0)
+                  like_count = int(metrics.get("like_count") or 0)
+                  share_count = int(metrics.get("share_count") or 0)
+                  comment_count = int(metrics.get("comment_count") or 0)
+              except (TypeError, ValueError):
+                  rejected["missing_views"] += 1
+                  continue
+              if play_count <= 0:
+                  rejected["missing_views"] += 1
+                  continue
+
+              rows.append({
+                  "file_name": file_name,
+                  "video_id": str(item.get("video_id") or ""),
+                  "play_count": play_count,
+                  "like_count": like_count,
+                  "share_count": share_count,
+                  "comment_count": comment_count,
+                  "region": region,
+                  "author_region": author_region,
+              })
+
+          rows.sort(
+              key=lambda r: (
+                  r["play_count"],
+                  r["share_count"],
+                  r["like_count"],
+                  r["comment_count"],
+              ),
+              reverse=True,
+          )
+
+          selected = rows[:300]
+          if len(selected) != 300:
+              raise RuntimeError(f"Seulement {len(selected)} vidéos admissibles; 300 requises")
+
+          urls = []
+          seen = set()
+          for row in selected:
+              encoded_path = urllib.parse.quote(row["file_name"], safe="/")
+              url = f"https://huggingface.co/datasets/{REPO_ID}/resolve/main/{encoded_path}?download=true"
+              if url in seen:
+                  raise RuntimeError(f"URL dupliquée: {url}")
+              seen.add(url)
+              urls.append(url)
+
+          OUTPUT.write_text("\n".join(urls) + "\n", encoding="utf-8")
+          REPORT.write_text(
+              json.dumps(
+                  {
+                      "dataset": REPO_ID,
+                      "selection_rule": {
+                          "regions": sorted(WESTERN_REGIONS),
+                          "region_and_author_region_required": True,
+                          "exclude_ads": True,
+                          "exclude_ai_generated": True,
+                          "ranking": ["play_count", "share_count", "like_count", "comment_count"],
+                      },
+                      "source_rows": len(data),
+                      "eligible_rows": len(rows),
+                      "selected_rows": len(selected),
+                      "unique_urls": len(seen),
+                      "rejected": rejected,
+                      "highest_play_count": selected[0]["play_count"],
+                      "lowest_play_count": selected[-1]["play_count"],
+                      "top_10": selected[:10],
+                  },
+                  ensure_ascii=False,
+                  indent=2,
+              ) + "\n",
+              encoding="utf-8",
+          )
+
+          assert OUTPUT.read_text(encoding="utf-8").count("\n") == 300
+          assert len(set(OUTPUT.read_text(encoding="utf-8").splitlines())) == 300
+          print(REPORT.read_text(encoding="utf-8"))
+          PY
+
+          python /tmp/generate_links.py
+          wc -l top_300_videos_virales_occidentales.txt
+          head -n 3 top_300_videos_virales_occidentales.txt
+          tail -n 3 top_300_videos_virales_occidentales.txt
+
+      - name: Upload generated TXT
+        uses: actions/upload-artifact@v4
+        with:
+          name: top-300-western-viral-mp4-links
+          path: |
+            top_300_videos_virales_occidentales.txt
+            top_300_videos_virales_occidentales_report.json
+          if-no-files-found: error
+          retention-days: 1
